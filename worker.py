@@ -1,5 +1,6 @@
 """
 worker.py — Async worker pool. Fetch → Parse → Deduplicate → Store.
+Uses correct LeetCode GraphQL fields confirmed from API error messages.
 """
 
 import asyncio
@@ -21,29 +22,46 @@ logger = logging.getLogger("scraper.worker")
 
 
 def _detail_query(topic_id: str) -> Dict[str, Any]:
+    """
+    Fetch full post content by topic ID.
+    Uses only confirmed valid fields on LeetCode's schema.
+    """
     return {
         "operationName": "DiscussTopic",
         "variables": {"topicId": int(topic_id)},
-        "query": """
-        query DiscussTopic($topicId: Int!) {
-          topic(id: $topicId) {
-            id title creationDate
-            post { content author { username } }
-          }
-        }
-        """,
+        "query": """query DiscussTopic($topicId: Int!) {
+  topic(id: $topicId) {
+    id
+    title
+    post {
+      creationDate
+      content
+      author {
+        username
+      }
+    }
+  }
+}""",
     }
 
 
 async def _fetch_topic(session: aiohttp.ClientSession, post: Dict[str, Any]):
     tid = post["id"]
+    headers = random.choice(HEADERS_POOL).copy()
+    headers.update({
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://leetcode.com",
+        "Referer": f"https://leetcode.com/discuss/interview-experience/{tid}/",
+    })
+
     for attempt in range(1, MAX_RETRIES + 1):
         await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
         try:
             async with session.post(
                 GRAPHQL_URL,
                 json=_detail_query(tid),
-                headers=random.choice(HEADERS_POOL),
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             ) as resp:
                 if resp.status == 429:
@@ -54,11 +72,19 @@ async def _fetch_topic(session: aiohttp.ClientSession, post: Dict[str, Any]):
                 if resp.status in (403, 404):
                     logger.warning(f"[{tid}] HTTP {resp.status} — skipping.")
                     return None
+                if resp.status == 400:
+                    body = await resp.text()
+                    logger.error(f"[{tid}] 400 Bad Request: {body[:300]}")
+                    return None
                 if not resp.ok:
                     await asyncio.sleep(BACKOFF_BASE ** attempt)
                     continue
                 data = await resp.json(content_type=None)
+                if "errors" in data:
+                    logger.error(f"[{tid}] GraphQL errors: {data['errors']}")
+                    return None
                 return data.get("data", {}).get("topic")
+
         except asyncio.TimeoutError:
             logger.warning(f"[{tid}] Timeout attempt {attempt}/{MAX_RETRIES}.")
             await asyncio.sleep(BACKOFF_BASE ** attempt)
@@ -72,10 +98,10 @@ async def _fetch_topic(session: aiohttp.ClientSession, post: Dict[str, Any]):
 
 class WorkerPool:
     def __init__(self, storage: Storage, deduplicator: Deduplicator, max_workers: int = 3):
-        self._storage      = storage
-        self._dedup        = deduplicator
-        self._parser       = Parser()
-        self._max_workers  = max_workers
+        self._storage     = storage
+        self._dedup       = deduplicator
+        self._parser      = Parser()
+        self._max_workers = max_workers
 
     async def process(self, posts: List[Dict[str, Any]]) -> int:
         sem   = asyncio.Semaphore(self._max_workers)
@@ -113,13 +139,16 @@ class WorkerPool:
         return saved
 
     async def _process_one(self, session, post) -> bool:
-        tid   = post["id"]
-        slug  = post.get("slug", "")
-        url   = f"https://leetcode.com/discuss/interview-experience/{slug}"
+        tid = post["id"]
+        url = post.get("url", f"https://leetcode.com/discuss/interview-experience/{tid}/")
 
         topic = await _fetch_topic(session, post)
         if topic is None:
             return False
+
+        # Attach creationDate from post.creationDate
+        if "post" in topic and "creationDate" in topic["post"]:
+            topic["creationDate"] = topic["post"]["creationDate"]
 
         try:
             record = self._parser.parse(topic, url)
