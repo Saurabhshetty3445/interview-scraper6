@@ -1,12 +1,14 @@
 """
-monitor.py — Fixed with correct LeetCode GraphQL field names.
+monitor.py — Only scrapes NEW posts published after the scraper started.
 
-LeetCode API error told us exactly:
-  - "slug" does not exist on TopicRelayNode
-  - "creationDate" does not exist → use "questionTitle" hint led us to correct schema
-  
-Correct fields on TopicRelayNode: id, title, post { voteCount, creationDate }
-We build the post URL from the topic id directly.
+First run behaviour:
+  - Fetches current 50 posts, marks ALL as seen, saves NONE.
+  - This sets the "baseline" — everything before now is ignored.
+
+Every run after:
+  - Fetches latest posts.
+  - Any ID not in seen list = genuinely new post published after baseline.
+  - Only those get scraped and saved.
 """
 
 import asyncio
@@ -26,10 +28,15 @@ from config import (
 
 logger = logging.getLogger("scraper.monitor")
 
+BASELINE_DONE_FILE = "baseline_done.txt"
+
 
 class Monitor:
     def __init__(self):
         self._seen: set = self._load_seen()
+        self._baseline_done: bool = Path(BASELINE_DONE_FILE).exists()
+
+    # ── Persistence ────────────────────────────────────────────────────────────
 
     def _load_seen(self) -> set:
         p = Path(PROCESSED_IDS_FILE)
@@ -48,17 +55,22 @@ class Monitor:
             "\n".join(sorted(self._seen)), encoding="utf-8"
         )
 
+    def _mark_baseline_done(self):
+        Path(BASELINE_DONE_FILE).write_text("done", encoding="utf-8")
+        self._baseline_done = True
+        logger.info("Baseline set. From next cycle, only NEW posts will be scraped.")
+
+    # ── Relevance ──────────────────────────────────────────────────────────────
+
     @staticmethod
     def _is_relevant(title: str) -> bool:
         lower = title.lower()
         return any(p in lower for p in TARGET_PHRASES)
 
+    # ── GraphQL ────────────────────────────────────────────────────────────────
+
     @staticmethod
     def _build_query(skip: int = 0, first: int = MONITOR_PAGE_SIZE) -> Dict[str, Any]:
-        """
-        Correct query using only fields that exist on LeetCode's TopicRelayNode.
-        Confirmed working fields: id, title, post { creationDate, author { username } }
-        """
         return {
             "operationName": "categoryTopicList",
             "variables": {
@@ -99,19 +111,18 @@ class Monitor:
         })
         return base
 
-    async def fetch_new_posts(self) -> List[Dict[str, Any]]:
-        new_posts = []
-        headers = self._build_headers()
+    # ── HTTP fetch ─────────────────────────────────────────────────────────────
 
+    async def _fetch_edges(self) -> List[Dict[str, Any]]:
+        headers = self._build_headers()
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
 
         async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
+            connector=connector, timeout=timeout
         ) as session:
 
-            # Warm up session with a page visit to get cookies
+            # Warm up — get session cookies first
             try:
                 await asyncio.sleep(random.uniform(1.0, 2.0))
                 async with session.get(
@@ -137,16 +148,13 @@ class Monitor:
                         logger.warning("Rate limited (429) — waiting 60s.")
                         await asyncio.sleep(60)
                         return []
-
                     if status == 403:
                         logger.warning("403 Forbidden.")
                         return []
-
                     if status == 400:
                         body = await resp.text()
                         logger.error(f"400 Bad Request: {body[:500]}")
                         return []
-
                     if not resp.ok:
                         logger.warning(f"HTTP {status} — skipping.")
                         return []
@@ -160,51 +168,87 @@ class Monitor:
                 logger.error(f"Monitor request failed: {e}")
                 return []
 
-        # Check for GraphQL errors
         if "errors" in data:
             logger.error(f"GraphQL errors: {data['errors']}")
             return []
 
-        edges = (
+        return (
             data.get("data", {})
                 .get("categoryTopicList", {})
                 .get("edges", [])
         )
 
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    async def fetch_new_posts(self) -> List[Dict[str, Any]]:
+        edges = await self._fetch_edges()
+
+        if not edges:
+            return []
+
+        # ── FIRST RUN: set baseline, scrape nothing ────────────────────────────
+        if not self._baseline_done:
+            count = 0
+            for edge in edges:
+                pid = str(edge.get("node", {}).get("id", ""))
+                if pid:
+                    self._seen.add(pid)
+                    count += 1
+            self._save_seen()
+            self._mark_baseline_done()
+            logger.info(
+                f"BASELINE: Marked {count} existing posts as seen. "
+                f"Scraper will only collect posts published from NOW onwards."
+            )
+            return []  # nothing to scrape on first run
+
+        # ── SUBSEQUENT RUNS: only new posts ───────────────────────────────────
+        new_posts: List[Dict[str, Any]] = []
+
         for edge in edges:
             node  = edge.get("node", {})
             pid   = str(node.get("id", ""))
             title = node.get("title", "")
-            # creationDate lives inside post now
             date  = node.get("post", {}).get("creationDate", 0)
 
             if not pid:
                 continue
+
+            # Already seen — skip silently
             if pid in self._seen:
                 continue
+
+            # Mark seen immediately (relevant or not)
+            self._seen.add(pid)
+
+            # Relevance filter
             if not self._is_relevant(title):
-                logger.debug(f"Irrelevant: {title!r}")
-                self._seen.add(pid)
+                logger.info(f"Skipped (not interview-related): {title!r}")
                 continue
 
-            # Build URL from topic ID (no slug needed)
             url = f"https://leetcode.com/discuss/interview-experience/{pid}/"
-
             new_posts.append({
                 "id":    pid,
                 "title": title,
                 "date":  date,
                 "url":   url,
             })
-            self._seen.add(pid)
+            logger.info(f"New relevant post found: {title!r}")
 
         self._save_seen()
         Path(QUEUE_FILE).write_text(
             json.dumps(new_posts, indent=2), encoding="utf-8"
         )
 
-        logger.info(
-            f"Monitor: {len(edges)} fetched, "
-            f"{len(new_posts)} new relevant post(s)."
-        )
+        if new_posts:
+            logger.info(
+                f"Monitor: {len(edges)} checked, "
+                f"{len(new_posts)} NEW relevant post(s) queued."
+            )
+        else:
+            logger.info(
+                f"Monitor: {len(edges)} checked, "
+                f"0 new relevant posts — waiting for new activity."
+            )
+
         return new_posts
