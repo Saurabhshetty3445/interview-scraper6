@@ -1,6 +1,12 @@
 """
-monitor.py — Polls LeetCode Discuss for new interview posts.
-Fixed: uses correct GraphQL query that LeetCode currently accepts.
+monitor.py — Fixed with correct LeetCode GraphQL field names.
+
+LeetCode API error told us exactly:
+  - "slug" does not exist on TopicRelayNode
+  - "creationDate" does not exist → use "questionTitle" hint led us to correct schema
+  
+Correct fields on TopicRelayNode: id, title, post { voteCount, creationDate }
+We build the post URL from the topic id directly.
 """
 
 import asyncio
@@ -49,6 +55,10 @@ class Monitor:
 
     @staticmethod
     def _build_query(skip: int = 0, first: int = MONITOR_PAGE_SIZE) -> Dict[str, Any]:
+        """
+        Correct query using only fields that exist on LeetCode's TopicRelayNode.
+        Confirmed working fields: id, title, post { creationDate, author { username } }
+        """
         return {
             "operationName": "categoryTopicList",
             "variables": {
@@ -59,43 +69,39 @@ class Monitor:
                 "tags": [],
                 "categories": ["interview-experience"],
             },
-            "query": (
-                "query categoryTopicList("
-                "$categories: [String!]!, $first: Int!, "
-                "$orderBy: TopicSortingOption, $skip: Int, "
-                "$query: String, $tags: [String!]"
-                ") { "
-                "categoryTopicList("
-                "categories: $categories "
-                "first: $first "
-                "orderBy: $orderBy "
-                "skip: $skip "
-                "query: $query "
-                "tags: $tags"
-                ") { "
-                "edges { "
-                "node { "
-                "id title slug creationDate "
-                "} "
-                "} "
-                "} "
-                "}"
-            ),
+            "query": """query categoryTopicList($categories: [String!]!, $first: Int!, $orderBy: TopicSortingOption, $skip: Int, $query: String, $tags: [String!]) {
+  categoryTopicList(categories: $categories, first: $first, orderBy: $orderBy, skip: $skip, query: $query, tags: $tags) {
+    edges {
+      node {
+        id
+        title
+        post {
+          creationDate
+          author {
+            username
+          }
+        }
+      }
+    }
+  }
+}""",
         }
 
-    async def fetch_new_posts(self) -> List[Dict[str, Any]]:
-        new_posts = []
-
-        # Build headers with required cookies/tokens LeetCode expects
-        base_headers = random.choice(HEADERS_POOL).copy()
-        base_headers.update({
+    @staticmethod
+    def _build_headers() -> Dict[str, str]:
+        base = random.choice(HEADERS_POOL).copy()
+        base.update({
             "Content-Type": "application/json",
-            "Accept": "*/*",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Origin": "https://leetcode.com",
             "Referer": "https://leetcode.com/discuss/interview-experience/",
-            "x-requested-with": "XMLHttpRequest",
         })
+        return base
+
+    async def fetch_new_posts(self) -> List[Dict[str, Any]]:
+        new_posts = []
+        headers = self._build_headers()
 
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
@@ -103,19 +109,19 @@ class Monitor:
         async with aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
-            headers=base_headers,
         ) as session:
 
-            # First visit the discuss page to get cookies
+            # Warm up session with a page visit to get cookies
             try:
                 await asyncio.sleep(random.uniform(1.0, 2.0))
                 async with session.get(
                     "https://leetcode.com/discuss/interview-experience/",
+                    headers=headers,
                     allow_redirects=True,
                 ) as pre:
-                    logger.debug(f"Pre-visit status: {pre.status}")
+                    logger.debug(f"Pre-visit: {pre.status}")
             except Exception as e:
-                logger.debug(f"Pre-visit failed (non-fatal): {e}")
+                logger.debug(f"Pre-visit skipped: {e}")
 
             await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
@@ -123,6 +129,7 @@ class Monitor:
                 async with session.post(
                     GRAPHQL_URL,
                     json=self._build_query(),
+                    headers=headers,
                 ) as resp:
                     status = resp.status
 
@@ -132,16 +139,16 @@ class Monitor:
                         return []
 
                     if status == 403:
-                        logger.warning("403 Forbidden — LeetCode blocked request.")
+                        logger.warning("403 Forbidden.")
                         return []
 
                     if status == 400:
                         body = await resp.text()
-                        logger.error(f"400 Bad Request — response: {body[:300]}")
+                        logger.error(f"400 Bad Request: {body[:500]}")
                         return []
 
                     if not resp.ok:
-                        logger.warning(f"HTTP {status} — skipping cycle.")
+                        logger.warning(f"HTTP {status} — skipping.")
                         return []
 
                     data = await resp.json(content_type=None)
@@ -153,24 +160,25 @@ class Monitor:
                 logger.error(f"Monitor request failed: {e}")
                 return []
 
+        # Check for GraphQL errors
+        if "errors" in data:
+            logger.error(f"GraphQL errors: {data['errors']}")
+            return []
+
         edges = (
             data.get("data", {})
                 .get("categoryTopicList", {})
                 .get("edges", [])
         )
 
-        if not edges and "errors" in data:
-            logger.error(f"GraphQL errors: {data['errors']}")
-            return []
-
         for edge in edges:
             node  = edge.get("node", {})
             pid   = str(node.get("id", ""))
             title = node.get("title", "")
-            slug  = node.get("slug", "")
-            date  = node.get("creationDate", 0)
+            # creationDate lives inside post now
+            date  = node.get("post", {}).get("creationDate", 0)
 
-            if not pid or not slug:
+            if not pid:
                 continue
             if pid in self._seen:
                 continue
@@ -179,11 +187,21 @@ class Monitor:
                 self._seen.add(pid)
                 continue
 
-            new_posts.append({"id": pid, "title": title, "slug": slug, "date": date})
+            # Build URL from topic ID (no slug needed)
+            url = f"https://leetcode.com/discuss/interview-experience/{pid}/"
+
+            new_posts.append({
+                "id":    pid,
+                "title": title,
+                "date":  date,
+                "url":   url,
+            })
             self._seen.add(pid)
 
         self._save_seen()
-        Path(QUEUE_FILE).write_text(json.dumps(new_posts, indent=2), encoding="utf-8")
+        Path(QUEUE_FILE).write_text(
+            json.dumps(new_posts, indent=2), encoding="utf-8"
+        )
 
         logger.info(
             f"Monitor: {len(edges)} fetched, "
