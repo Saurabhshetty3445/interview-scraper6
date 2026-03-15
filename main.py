@@ -1,20 +1,10 @@
 """
-main.py — Railway entry point.
-
-Runs forever in a loop:
-  1. Poll LeetCode for new interview posts
-  2. Scrape + parse + deduplicate + save to CSV + push to Google Sheets
-  3. Sleep for POLL_INTERVAL_MINUTES
-  4. Repeat
-
-Railway keeps this process alive 24/7 automatically.
+main.py — Railway entry point. Runs forever polling LeetCode.
 """
 
 import asyncio
 import logging
 import sys
-import time
-from pathlib import Path
 
 from config import POLL_INTERVAL_MINUTES
 from monitor import Monitor
@@ -22,12 +12,11 @@ from worker import WorkerPool
 from storage import Storage
 from deduplicate import Deduplicator
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),          # Railway shows stdout logs
+        logging.StreamHandler(sys.stdout),
         logging.FileHandler("logs.txt", encoding="utf-8"),
     ],
 )
