@@ -1,6 +1,8 @@
 """
-worker.py — Async worker pool. Fetch → Parse → Deduplicate → Store.
-Uses correct LeetCode GraphQL fields confirmed from API error messages.
+worker.py — Fetch full post content using correct LeetCode URL format.
+
+LeetCode post URL: https://leetcode.com/discuss/post/{ID}/
+GraphQL fetch by topic ID still works the same way.
 """
 
 import asyncio
@@ -22,10 +24,6 @@ logger = logging.getLogger("scraper.worker")
 
 
 def _detail_query(topic_id: str) -> Dict[str, Any]:
-    """
-    Fetch full post content by topic ID.
-    Uses only confirmed valid fields on LeetCode's schema.
-    """
     return {
         "operationName": "DiscussTopic",
         "variables": {"topicId": int(topic_id)},
@@ -45,14 +43,17 @@ def _detail_query(topic_id: str) -> Dict[str, Any]:
     }
 
 
-async def _fetch_topic(session: aiohttp.ClientSession, post: Dict[str, Any]):
+async def _fetch_topic(
+    session: aiohttp.ClientSession,
+    post: Dict[str, Any],
+) -> Dict[str, Any] | None:
     tid = post["id"]
     headers = random.choice(HEADERS_POOL).copy()
     headers.update({
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
         "Origin": "https://leetcode.com",
-        "Referer": f"https://leetcode.com/discuss/interview-experience/{tid}/",
+        "Referer": f"https://leetcode.com/discuss/post/{tid}/",
     })
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -66,7 +67,7 @@ async def _fetch_topic(session: aiohttp.ClientSession, post: Dict[str, Any]):
             ) as resp:
                 if resp.status == 429:
                     wait = BACKOFF_BASE ** attempt + random.uniform(0, 2)
-                    logger.warning(f"[{tid}] 429 rate limit. Waiting {wait:.1f}s.")
+                    logger.warning(f"[{tid}] 429 — waiting {wait:.1f}s.")
                     await asyncio.sleep(wait)
                     continue
                 if resp.status in (403, 404):
@@ -79,11 +80,22 @@ async def _fetch_topic(session: aiohttp.ClientSession, post: Dict[str, Any]):
                 if not resp.ok:
                     await asyncio.sleep(BACKOFF_BASE ** attempt)
                     continue
+
                 data = await resp.json(content_type=None)
                 if "errors" in data:
                     logger.error(f"[{tid}] GraphQL errors: {data['errors']}")
                     return None
-                return data.get("data", {}).get("topic")
+
+                topic = data.get("data", {}).get("topic")
+                if not topic:
+                    logger.warning(f"[{tid}] Empty topic in response.")
+                    return None
+
+                # Hoist creationDate to top level for parser
+                if topic.get("post", {}).get("creationDate"):
+                    topic["creationDate"] = topic["post"]["creationDate"]
+
+                return topic
 
         except asyncio.TimeoutError:
             logger.warning(f"[{tid}] Timeout attempt {attempt}/{MAX_RETRIES}.")
@@ -97,7 +109,12 @@ async def _fetch_topic(session: aiohttp.ClientSession, post: Dict[str, Any]):
 
 
 class WorkerPool:
-    def __init__(self, storage: Storage, deduplicator: Deduplicator, max_workers: int = 3):
+    def __init__(
+        self,
+        storage: Storage,
+        deduplicator: Deduplicator,
+        max_workers: int = 3,
+    ):
         self._storage     = storage
         self._dedup       = deduplicator
         self._parser      = Parser()
@@ -140,15 +157,13 @@ class WorkerPool:
 
     async def _process_one(self, session, post) -> bool:
         tid = post["id"]
-        url = post.get("url", f"https://leetcode.com/discuss/interview-experience/{tid}/")
+        url = post.get("url", f"https://leetcode.com/discuss/post/{tid}/")
+
+        logger.info(f"[{tid}] Fetching full content from {url}")
 
         topic = await _fetch_topic(session, post)
         if topic is None:
             return False
-
-        # Attach creationDate from post.creationDate
-        if "post" in topic and "creationDate" in topic["post"]:
-            topic["creationDate"] = topic["post"]["creationDate"]
 
         try:
             record = self._parser.parse(topic, url)
@@ -157,6 +172,7 @@ class WorkerPool:
             return False
 
         if record is None:
+            logger.info(f"[{tid}] Parser returned no record.")
             return False
 
         dup = self._dedup.check(record)
@@ -167,7 +183,10 @@ class WorkerPool:
         try:
             self._storage.save(record)
             self._dedup.register(record)
-            logger.info(f"[{tid}] SAVED — {record['company']} | {record['title'][:60]}")
+            logger.info(
+                f"[{tid}] ✅ SAVED — "
+                f"{record['company']} | {record['title'][:70]}"
+            )
             return True
         except Exception as e:
             logger.error(f"[{tid}] Storage error: {e}")
